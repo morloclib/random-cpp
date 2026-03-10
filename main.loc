@@ -1,0 +1,41 @@
+module random-cpp (*)
+
+import random
+import root-cpp
+
+
+-- Typeclass instances
+-----------------------
+
+instance Random Real where
+  source Cpp from "core.hpp" ("morloc_random_real" as random)
+
+instance Random Int where
+  source Cpp from "core.hpp" ("morloc_random_int" as random)
+
+instance Random Bool where
+  source Cpp from "core.hpp" ("morloc_random_bool" as random)
+
+instance RandomRange Real where
+  source Cpp from "core.hpp" ("morloc_randomRange_real" as randomRange)
+
+instance RandomRange Int where
+  source Cpp from "core.hpp" ("morloc_randomRange_int" as randomRange)
+
+instance RandomGroup List where
+  source Cpp from "core.hpp"
+    ( "morloc_choice" as choice
+    , "morloc_weightedChoice" as weightedChoice
+    , "morloc_sample" as sample
+    , "morloc_sampleWith" as sampleWith
+    , "morloc_permute" as permute
+    )
+
+
+-- Standalone functions
+------------------------
+
+source Cpp from "core.hpp"
+    ( "morloc_bernoulli" as bernoulli
+    , "morloc_setSeed" as setSeed
+    )

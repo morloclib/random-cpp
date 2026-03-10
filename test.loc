@@ -1,0 +1,4 @@
+module test-random-cpp (test)
+
+import random.test (test)
+import random-cpp
