@@ -19,9 +19,8 @@ std::mt19937& morloc_rng() {
 
 } // anonymous namespace
 
-mlc::Unit morloc_setSeed(int seed) {
+void morloc_setSeed(int seed) {
     morloc_rng().seed(static_cast<unsigned>(seed));
-    return mlc::Unit();
 }
 
 double morloc_random_real() {
