@@ -8,75 +8,135 @@
 #include <cstdint>
 #include <tuple>
 #include <string>
+#include <mutex>
+#include <stdexcept>
 #include "mlccpptypes/prelude.hpp"
 
-namespace {
+namespace morloc_random_internal {
 
-std::mt19937& morloc_rng() {
-    static thread_local std::mt19937 gen(std::random_device{}());
+// One engine for the whole process, as Python's and R's random state are: a
+// pool serves calls on several threads, and a seed set by one call must
+// govern the next whichever thread serves it. Every draw below maps engine
+// output to a value by an algorithm fixed here, not by the standard library's
+// distributions, whose algorithms differ between libstdc++ and libc++: a
+// seeded program prints the same numbers on Linux and macOS.
+inline std::mutex& rng_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+inline std::mt19937& rng() {
+    static std::mt19937 gen(std::random_device{}());
     return gen;
 }
 
-} // anonymous namespace
+// Uniform in [0, range), range >= 1, by rejection: unbiased.
+inline uint64_t below(uint64_t range) {
+    std::mt19937& g = rng();
+    if (range <= (uint64_t(1) << 32)) {
+        const uint64_t span = uint64_t(1) << 32;
+        const uint64_t limit = span - span % range;
+        uint64_t x;
+        do {
+            x = g();
+        } while (x >= limit);
+        return x % range;
+    }
+    // The largest multiple of `range` minus one that a 64-bit draw reaches.
+    const uint64_t limit = UINT64_MAX - (UINT64_MAX % range + 1) % range;
+    uint64_t x;
+    do {
+        x = (uint64_t(g()) << 32) | g();
+    } while (x > limit);
+    return x % range;
+}
+
+// Uniform in [0, 1) with 53 random bits, as CPython's random() makes them.
+inline double unit() {
+    std::mt19937& g = rng();
+    const uint64_t a = g() >> 5, b = g() >> 6;
+    return (double(a) * 67108864.0 + double(b)) * (1.0 / 9007199254740992.0);
+}
+
+} // namespace morloc_random_internal
 
 void morloc_setSeed(int seed) {
-    morloc_rng().seed(static_cast<unsigned>(seed));
+    std::lock_guard<std::mutex> lk(morloc_random_internal::rng_mutex());
+    morloc_random_internal::rng().seed(static_cast<unsigned>(seed));
 }
 
 double morloc_random_real() {
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    return dist(morloc_rng());
+    std::lock_guard<std::mutex> lk(morloc_random_internal::rng_mutex());
+    return morloc_random_internal::unit();
 }
 
 int morloc_random_int() {
-    std::uniform_int_distribution<int> dist(0, 2147483647);
-    return dist(morloc_rng());
+    std::lock_guard<std::mutex> lk(morloc_random_internal::rng_mutex());
+    return static_cast<int>(morloc_random_internal::below(uint64_t(2147483647) + 1));
 }
 
 bool morloc_random_bool() {
-    std::uniform_int_distribution<int> dist(0, 1);
-    return dist(morloc_rng()) == 1;
+    std::lock_guard<std::mutex> lk(morloc_random_internal::rng_mutex());
+    return morloc_random_internal::below(2) == 1;
 }
 
 double morloc_randomRange_real(double lo, double hi) {
-    std::uniform_real_distribution<double> dist(lo, hi);
-    return dist(morloc_rng());
+    std::lock_guard<std::mutex> lk(morloc_random_internal::rng_mutex());
+    return lo + (hi - lo) * morloc_random_internal::unit();
 }
 
 int morloc_randomRange_int(int lo, int hi) {
-    std::uniform_int_distribution<int> dist(lo, hi);
-    return dist(morloc_rng());
+    if (hi < lo) throw std::invalid_argument("randomRange: the upper bound is below the lower");
+    std::lock_guard<std::mutex> lk(morloc_random_internal::rng_mutex());
+    const uint64_t range = uint64_t(int64_t(hi) - int64_t(lo)) + 1;
+    return static_cast<int>(int64_t(lo) + int64_t(morloc_random_internal::below(range)));
 }
 
 bool morloc_bernoulli(double p) {
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    return dist(morloc_rng()) < p;
+    std::lock_guard<std::mutex> lk(morloc_random_internal::rng_mutex());
+    return morloc_random_internal::unit() < p;
 }
 
 template <typename T>
 T morloc_choice(const std::vector<T>& xs) {
-    std::uniform_int_distribution<size_t> dist(0, xs.size() - 1);
-    return xs[dist(morloc_rng())];
+    if (xs.empty()) throw std::invalid_argument("choice: the list is empty");
+    std::lock_guard<std::mutex> lk(morloc_random_internal::rng_mutex());
+    return xs[morloc_random_internal::below(xs.size())];
 }
 
 template <typename T>
 T morloc_weightedChoice(const std::vector<std::tuple<double, T>>& pairs) {
-    std::vector<double> weights;
-    weights.reserve(pairs.size());
+    double total = 0;
     for (const auto& p : pairs) {
-        weights.push_back(std::get<0>(p));
+        if (std::get<0>(p) < 0) throw std::invalid_argument("weightedChoice: a weight is negative");
+        total += std::get<0>(p);
     }
-    std::discrete_distribution<size_t> dist(weights.begin(), weights.end());
-    return std::get<1>(pairs[dist(morloc_rng())]);
+    if (!(total > 0)) throw std::invalid_argument("weightedChoice: the weights sum to zero");
+    std::lock_guard<std::mutex> lk(morloc_random_internal::rng_mutex());
+    const double r = morloc_random_internal::unit() * total;
+    double cum = 0;
+    for (const auto& p : pairs) {
+        cum += std::get<0>(p);
+        if (r < cum) return std::get<1>(p);
+    }
+    // Rounding can leave r at the very top: the last positive weight takes it.
+    for (auto it = pairs.rbegin(); it != pairs.rend(); ++it) {
+        if (std::get<0>(*it) > 0) return std::get<1>(*it);
+    }
+    return std::get<1>(pairs.back());
 }
 
 template <typename T>
 std::vector<T> morloc_sample(int n, const std::vector<T>& xs) {
+    if (n < 0 || static_cast<size_t>(n) > xs.size()) {
+        throw std::invalid_argument("sample: cannot draw " + std::to_string(n) + " of " +
+                                    std::to_string(xs.size()) + " without replacement");
+    }
     std::vector<T> pool(xs);
-    size_t k = static_cast<size_t>(n);
+    const size_t k = static_cast<size_t>(n);
+    std::lock_guard<std::mutex> lk(morloc_random_internal::rng_mutex());
     for (size_t i = 0; i < k; ++i) {
-        std::uniform_int_distribution<size_t> dist(i, pool.size() - 1);
-        std::swap(pool[i], pool[dist(morloc_rng())]);
+        std::swap(pool[i], pool[i + morloc_random_internal::below(pool.size() - i)]);
     }
     pool.resize(k);
     return pool;
@@ -84,11 +144,12 @@ std::vector<T> morloc_sample(int n, const std::vector<T>& xs) {
 
 template <typename T>
 std::vector<T> morloc_sampleWith(int n, const std::vector<T>& xs) {
+    if (n > 0 && xs.empty()) throw std::invalid_argument("sampleWith: the list is empty");
     std::vector<T> result;
-    result.reserve(static_cast<size_t>(n));
-    std::uniform_int_distribution<size_t> dist(0, xs.size() - 1);
+    result.reserve(static_cast<size_t>(std::max(n, 0)));
+    std::lock_guard<std::mutex> lk(morloc_random_internal::rng_mutex());
     for (int i = 0; i < n; ++i) {
-        result.push_back(xs[dist(morloc_rng())]);
+        result.push_back(xs[morloc_random_internal::below(xs.size())]);
     }
     return result;
 }
@@ -96,9 +157,9 @@ std::vector<T> morloc_sampleWith(int n, const std::vector<T>& xs) {
 template <typename T>
 std::vector<T> morloc_permute(const std::vector<T>& xs) {
     std::vector<T> result(xs);
+    std::lock_guard<std::mutex> lk(morloc_random_internal::rng_mutex());
     for (size_t i = result.size(); i > 1; --i) {
-        std::uniform_int_distribution<size_t> dist(0, i - 1);
-        std::swap(result[i - 1], result[dist(morloc_rng())]);
+        std::swap(result[i - 1], result[morloc_random_internal::below(i)]);
     }
     return result;
 }
